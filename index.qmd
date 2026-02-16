@@ -1,0 +1,29 @@
+
+```{r} 
+#install.packages("tidyverse")
+install.packages("sf")
+
+library(tidyverse)
+library(sf)
+
+
+```
+
+
+
+```{r}
+
+FILES <- list.files("./data")
+
+PATHS <- paste0("./data", "/", FILES)
+
+
+geodata <- map(PATHS, sf::st_read)
+
+
+
+```
+
+
+
+
