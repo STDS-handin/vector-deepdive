@@ -1,0 +1,344 @@
+# Task 1
+
+---
+
+Download the datasets swissTLM3D and swissboundaries3d from swisstopo. Using `swissTLM3d` and `swissboundaries3d`, calculate the percentage of area covered by forest *per canton*. Visualize the results (in a map and / or a plot).
+
+Render the document using `quarto preview`. Publish your result using `quarto publish gh-pages`
+
+# Solution 1
+
+---
+
+First, the data must be read in. I downloaded geopackages. These can be loaded into memory using
+st_read(). There are multible layers in the geopakcages, so one also needs to state which one
+should be loaded. For the canton boundaries we need the layer "tlm_kantonsgebiet", for the forest data we need the
+layer "tlm_bb_bodenbedeckung".
+
+```{r}
+
+library(tidyverse)
+library(sf)
+library(tmap)
+library(units)
+library(tictoc)
+library(duckdb)
+
+
+```
+
+
+
+```{r}
+
+canton_polygons <- st_read(
+  "./data/swissBOUNDARIES3D_1_5_LV95_LN02.gpkg",
+  layer = "tlm_kantonsgebiet"
+  )
+
+
+ground_cover_polys <- st_read(
+  "./data/SWISSTLM3D_2025.gpkg", 
+  layer = "tlm_bb_bodenbedeckung"
+  )
+
+
+```
+
+The layer "tlm_kantonsgebiet" only contains the canton polygons. In the layer
+"tlm_bb_bodenbedeckung" there is a range of differentl landcover classes. If we only
+want forest polygons, some filtering needs to be conduced. An overwiev over the different
+classes can be optained by looking at the unique values in the "objektart" column.
+
+
+```{r}
+
+ground_cover_polys %>%
+  pull("objektart") %>%
+  unique()
+
+```
+
+So it looks like there are actually three forest like categories. "Wald",
+"Wald offen" and "Gehoelzflaeche". From comparison with the Results of Task 2 I know
+that here only the class "Wald" should be selected, however this is generally open individual judgement and
+wheter "Wald offen" and "Gehoelzflaeche" should be included or excluded is not really determined in this context.
+Filtering over non geometrical columns can be done like with a standart dataframe. I
+personaly like using tidyverse and therefore use filte 
+
+```{r}
+
+forest_polys <- ground_cover_polys %>%
+  filter(objektart == "Wald")
+
+```
+
+Now the intersection between every canton and the forest polaygons needs to be determined. Next
+the area of the newly created forest polygons needs to be summed up. I first tried to implement this
+using spatial joins and so on, to perform the calculation for all cantons in one step. But my PC can not
+handle the memory requirements. I therefore opted for a strategy of perorming the intersection and 
+aggregation for every canton sequentially using a mapping procedure. This has the advantage, that
+the calculations do not all happen at once and my memory is sufficient.
+
+```{r}
+
+calculate_area_per_canton <- function(canton_name, canton_polys, forest_polys) {
+  # get the entry of the canton from the sf_object (this also contains the polynomial)
+  target_canton <- canton_polys %>%
+    filter(name == canton_name)
+
+  # intersect the forest polynomials of all of switzerland with the canton to get new poylnomails of
+  # all forest surfaces that cover the canton
+  forest_polys_intersected <- st_intersection(forest_polys, target_canton)
+
+  # as stated in the swissTLM3D manual, the different land covers considered as forest, can overlap
+  # so first we need to get the union of all surfaces to not sum any surface double
+  # then we can summ up the area
+  forested_area_per_canton <- forest_polys_intersected %>%
+    st_area() %>%
+    sum()
+
+  # lastly we return a named list with the canton name and the summed area
+  return(
+    list(name = canton_name, forested_area = forested_area_per_canton)
+  )
+}
+
+
+
+# we get all the canton names
+canton_names <- canton_polygons %>%
+  pull(name) %>%
+  unique()
+
+
+results_list <- map(
+  canton_names,
+  ~ calculate_area_per_canton(.x, canton_polygons, forest_polys),
+  .progress = "Calculation Progress"
+)
+
+
+# the resulting named lists can be combined to a dataframe
+results_df <- results_list %>%
+  bind_rows()
+
+```
+
+
+
+Now we got the cantons with their forested area. All that is left to do
+is to joint the result with the canton_polygons dataframe. This then allows us to
+calculate the relative surface coverage of forest for every canton. 
+
+```{r}
+
+
+# then we can join the caluclated areas with the geometries of the canton
+canton_forest_sf <- canton_polygons %>%
+  left_join(results_df, by = "name") %>%
+  mutate(
+    # we also calculate the total area of forest now to get percentage values later
+    total_canton_area = st_area(geom),
+
+    # Calculate the percentage (Forest Area / Total Area * 100)
+    forest_pct = as.numeric(forested_area / total_canton_area) * 100
+  )
+
+
+```
+
+Lastly, some ploting is needed
+
+
+```{r}
+
+# 3. Plot the PERCENTAGE on the map
+tm_shape(canton_forest_sf) +
+  tm_polygons(
+    col = "forest_pct", # Point to the new percentage column
+    style = "jenks",
+    palette = "Greens",
+    title = "Forest Cover (%)" # Update legend title
+  ) +
+  tm_layout(
+    main.title = "Percentage of Forest Cover by Swiss Canton",
+    frame = FALSE
+  )
+
+canton_forest_sf %>%
+  select(name, forest_pct) %>%
+    arrange(desc(forest_pct))
+
+
+
+```
+
+
+# Task 2
+
+We have prepared a duckdb database on moodle (`wald-kantone.duckdb`). This database contains two layers: The forest data from swissTLM3D and the canton boundaries from swissBOUNDARIES3D.
+
+Use this dataset and with the help of [DuckDB in practice], recreate [Task 1](#task-1) and measure the execution time using the R package `tictoc`.
+
+Compare the execution time with [Task 1](#task-1). Discuss!
+
+# Solution 2
+
+
+For this i first installed the duckdb with its commandline interface.
+https://duckdb.org/install/?platform=linux&environment=cli
+
+Then I created a set of views directly in the CLI. For this i largely followed the
+SQL quarries provided in the DuckDB slides.
+
+
+First, I created a view that captured the intersecting forest
+polygons for every canton and then calculates the area of the individual
+forest polygons
+
+```sql
+
+CREATE VIEW forest_per_canton AS
+SELECT
+  name,
+  st_area(st_intersection(wald.geom, kantone.geom)) AS wald_area
+FROM
+  wald,
+  kantone
+WHERE
+  st_intersects(wald.geom, kantone.geom);
+
+
+```
+
+Secondly, I used grouping, to sum all areas of a canton together to optain
+the total forested area per canton. This result, I also stored in a view
+
+
+```sql
+
+CREATE VIEW forest_sum_canton AS
+SELECT
+  name,
+  sum(wald_area) AS wald_area
+FROM
+  forest_per_canton
+GROUP BY
+  name;
+
+```
+
+Laslty, I joined the forest sum view with the canton table to calculate
+the percentual surface and yet again captured this in a view.
+
+
+```sql
+
+CREATE VIEW cantonal_forest_fractions AS
+SELECT
+  kantone.name,
+  (forest_sum_canton.wald_area / kantone.area) * 100 AS forest_fraction
+FROM
+  forest_sum_canton
+LEFT JOIN
+  kantone
+ON
+  forest_sum_canton.name = kantone.name
+ORDER BY
+  forest_fraction DESC;
+
+```
+
+This view can then be loaded into R using the DuckDB r package. Here, the timing
+can be conducted with tictoc, since a view is not materialized and will get computed,
+as soon the R code calls the view.
+
+
+```{r}
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = "./data/wald-kantone.duckdb",
+  read_only = TRUE
+)
+
+
+dbExecute(con, "INSTALL spatial;")
+dbExecute(con, "LOAD spatial;")
+
+tictoc::tic()
+
+canton_frac <- dbReadTable(con, "cantonal_forest_fractions")
+
+tictoc::toc()
+
+print(canton_frac)
+
+
+```
+
+
+
+Lets compare that to the standart R code from Taks 1
+
+
+```{r}
+
+
+tictoc::tic()
+
+
+results_list <- map(
+  canton_names,
+  ~ calculate_area_per_canton(.x, canton_polygons, forest_polys),
+  .progress = "Calculation Progress"
+)
+
+
+results_df <- results_list %>%
+  bind_rows()
+
+
+canton_forest_sf <- canton_polygons %>%
+  left_join(results_df, by = "name") %>%
+  mutate(
+    # we also calculate the total area of forest now to get percentage values later
+    total_canton_area = st_area(geom),
+
+    # Calculate the percentage (Forest Area / Total Area * 100)
+    forest_pct = as.numeric(forested_area / total_canton_area) * 100
+  )
+
+
+canton_forest_sf %>%
+  select(name, forest_pct) %>%
+    arrange(desc(forest_pct))
+    
+
+tictoc::toc()
+
+```
+
+
+
+### Why is the database so much faster:
+
+
+The reason for this, is that there is a spatial index set up for the forest table and for the canton table (which I setup myself). Due to these indices, the underlying querry optimizer
+can eliminate non overlaping geometries cheaply by checking wheter bounding boxes overlap. If they do not overlap, then we do not even have to start to
+perform "st_intersects".
+
+One can check the existance of the indices by looking at the Index tables
+
+
+
+```{r}
+
+
+dbGetQuery(con, "SELECT sql FROM duckdb_indexes();")
+
+```
+
+
+

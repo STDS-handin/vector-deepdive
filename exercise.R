@@ -1,23 +1,17 @@
-# install.packages("tidyverse")
-# install.packages("sf")
-# install.packages("tmap")
-
 library(tidyverse)
 library(sf)
 library(tmap)
+library(units)
+library(tictoc)
+library(duckdb)
 
-FILES <- list.files("./data")
-PATH <- file.path("./data", FILES)
-
-
-# First we need to look at what layers are present to pick the right one. We are interested in the canton boundaries
-PATH[1] %>% st_layers()
-# therefore tlm_kantonsgebiete is the layer of interest for us
 
 
 # lets now read in the canton polynomials
-canton_polygons <- PATH[1] %>%
-  st_read(layer = "tlm_kantonsgebiet")
+canton_polygons <- st_read(
+  "./data/swissBOUNDARIES3D_1_5_LV95_LN02.gpkg",
+  layer = "tlm_kantonsgebiet"
+  )
 
 # Lets have a look at this to have a visual understanding
 tm_shape(canton_polygons) +
@@ -32,9 +26,14 @@ PATH[2] %>% st_layers()
 # catalogue: wald, wald offen, gehölzfläche
 
 
-ground_cover_polys <- PATH[2] %>%
-  st_read(layer = "tlm_bb_bodenbedeckung")
+ground_cover_polys <- st_read(
+  ".data/SWISSTLM3D_2025.gpkg", 
+  layer = "tlm_bb_bodenbedeckung"
+  )
 
+ground_cover_polys %>%
+  pull("objektart") %>%
+  unique()
 
 # the polygons have codes. We can simply filter by code to optain the polygons
 # (tidyverse functions can also by applied to sf_objects since these are dataframes too)
@@ -43,35 +42,11 @@ ground_cover_polys <- PATH[2] %>%
 
 
 forest_polys <- ground_cover_polys %>%
-  filter(objektart %in% c("Wald", "Gehoelzflaeche", "Wald offen"))
+  filter(objektart == "Wald")
 
 # what is realy important here, is to accnoledge that the different area types can overlap
 # according to the manual. Therefore we need to get the union of all polygons first, so that
 # we later do not count surfaces double
-
-
-## scraped idea
-
-## forest_polys %>% colnames()
-##
-##
-## joined_polys <- st_join(
-##         x = canton_polygons,
-##         y = forest_polys,
-##         join = st_intersects
-##
-##     )
-##
-##
-##
-## joined_polys %>%
-##     mutate(
-##         area_of_polys = st_area(geom)
-##     )
-##
-##
-# this strategy is to memmory hungry since the join generates a huge
-# dataframe. I gues its better to perform this in a map sequentially
 
 
 # to avoid memory spikes, it is better to carry out the computations sequentially for every
@@ -89,7 +64,6 @@ calculate_area_per_canton <- function(canton_name, canton_polys, forest_polys) {
   # so first we need to get the union of all surfaces to not sum any surface double
   # then we can summ up the area
   forested_area_per_canton <- forest_polys_intersected %>%
-    st_union() %>%
     st_area() %>%
     sum()
 
@@ -105,9 +79,8 @@ canton_names <- canton_polygons %>%
   unique()
 
 
-# this takes for ever even tough the curvature of the earth is ignored (to speed up)
 
-sf_use_s2(FALSE)
+# this takes for ever even tough the curvature of the earth is ignored (to speed up)
 
 # and then we apply the calculation to every canton sequentially to get the forested area
 
@@ -118,9 +91,8 @@ results_list <- map(
   .progress = "Calculation Progress"
 )
 
-sf_use_s2(TRUE)
 
-library(units)
+
 
 # the resulting named lists can be combined to a dataframe
 results_df <- results_list %>%
@@ -149,3 +121,124 @@ tm_shape(canton_forest_sf) +
     main.title = "Percentage of Forest Cover by Swiss Canton",
     frame = FALSE
   )
+
+canton_forest_sf %>%
+  select(name, forest_pct) %>%
+    arrange(desc(forest_pct))
+
+
+con <- dbConnect(
+  duckdb(),
+  dbdir = "./data/wald-kantone.duckdb",
+  read_only = TRUE
+)
+
+
+
+
+dbExecute(con, "INSTALL spatial;")
+dbExecute(con, "LOAD spatial;")
+
+tictoc::tic()
+
+canton_frac <- dbReadTable(con, "cantonal_forest_fractions")
+
+tictoc::toc()
+
+print(canton_frac)
+
+
+
+
+tictoc::tic()
+
+
+results_list <- map(
+  canton_names,
+  ~ calculate_area_per_canton(.x, canton_polygons, forest_polys),
+  .progress = "Calculation Progress"
+)
+
+
+results_df <- results_list %>%
+  bind_rows()
+
+
+canton_forest_sf <- canton_polygons %>%
+  left_join(results_df, by = "name") %>%
+  mutate(
+    # we also calculate the total area of forest now to get percentage values later
+    total_canton_area = st_area(geom),
+
+    # Calculate the percentage (Forest Area / Total Area * 100)
+    forest_pct = as.numeric(forested_area / total_canton_area) * 100
+  )
+
+
+canton_forest_sf %>%
+  select(name, forest_pct) %>%
+    arrange(desc(forest_pct))
+    
+
+tictoc::toc()
+
+
+dbGetQuery(con, "SELECT sql FROM duckdb_indexes();")
+
+
+dbDisconnect(con)
+
+getwd()
+
+grid_orig <- st_read(
+  "./data/chessboard.gpkg",
+   layer = "grid_orig"
+  )
+
+grid_dest <- st_read(
+  "./data/chessboard.gpkg",
+   layer = "grid_dest"
+
+)
+
+
+st_rook <- \(x, y) st_relate(x, y, pattern = "F***1****")
+
+grid_rook <- grid_dest[grid_orig, , op = st_rook] |> 
+  st_sample(1000, type = "hexagonal",by_polygon = TRUE)
+
+
+st_bishop <- \(x, y) st_relate(x, y, pattern = "F***0****")
+
+grid_bishop <- grid_dest[grid_orig, , op = st_bishop] |> 
+  st_sample(1000, type = "hexagonal",by_polygon = TRUE)
+
+
+st_queen <- \(x, y) st_relate(x, y, pattern = "F***T****")
+
+grid_queen <- grid_dest[grid_orig, , op = st_queen] |> 
+  st_sample(1000, type = "hexagonal",by_polygon = TRUE)
+
+
+
+# --- 1. BISHOP VISUALIZATION ---
+plot(st_geometry(grid_dest), col = "#8fbc8f")
+plot(st_geometry(grid_orig), col = "#c8bfe7", add = TRUE)
+
+# Generate dots for Bishop (corner touches)
+dots_bishop <- grid_dest[grid_orig, , op = st_bishop] |> 
+  st_sample(1000, type = "hexagonal", by_polygon = TRUE)
+
+plot(st_geometry(dots_bishop), pch = 20, cex = 0.5, add = TRUE)
+text(st_coordinates(st_centroid(grid_orig)), labels = "♗", cex = 10)
+
+# --- 2. QUEEN VISUALIZATION ---
+plot(st_geometry(grid_dest), col = "#8fbc8f")
+plot(st_geometry(grid_orig), col = "#c8bfe7", add = TRUE)
+
+# Generate dots for Queen (all touches)
+dots_queen <- grid_dest[grid_orig, , op = st_queen] |> 
+  st_sample(1000, type = "hexagonal", by_polygon = TRUE)
+
+plot(st_geometry(dots_queen), pch = 20, cex = 0.5, add = TRUE)
+text(st_coordinates(st_centroid(grid_orig)), labels = "♕", cex = 10)

@@ -400,3 +400,4 @@ plot(st_geometry(dots_queen), pch = 20, cex = 0.5, add = TRUE)
 text(st_coordinates(st_centroid(grid_orig)), labels = "♕", cex = 10)
 
 ```
+
